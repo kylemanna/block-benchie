@@ -1,4 +1,5 @@
 *.svg
+block-benchie-*.md
 .codex
 /result
 /target/
