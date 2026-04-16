@@ -8,15 +8,18 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
+use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 const DEFAULT_BINS: usize = 200;
-const DEFAULT_SAMPLE_MIB: u64 = 200;
+const DEFAULT_SAMPLE_MS: u64 = 100;
 const READ_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const MIB: u64 = 1024 * 1024;
+const GIB: u64 = 1024 * MIB;
 const ALIGNMENT: u64 = 4096;
+const END_RUNWAY_BYTES: u64 = GIB;
 const BLKGETSIZE64: c_ulong = 0x8008_1272;
 const O_DIRECT: c_int = 0o40000;
 
@@ -28,7 +31,7 @@ unsafe extern "C" {
 struct Config {
     device: PathBuf,
     bins: usize,
-    sample_bytes: u64,
+    sample_duration: Duration,
     output: Option<PathBuf>,
 }
 
@@ -83,30 +86,29 @@ fn run() -> Result<(), String> {
         return Err(format!("{} has zero readable bytes", config.device.display()));
     }
 
-    let sample_bytes = align_down(config.sample_bytes.min(device_size), ALIGNMENT);
-    if sample_bytes == 0 {
+    if device_size < ALIGNMENT {
         return Err(format!(
             "{} has fewer than {ALIGNMENT} readable bytes; direct I/O requires aligned reads",
             config.device.display()
         ));
     }
 
-    let offsets = sample_offsets(device_size, sample_bytes, config.bins);
+    let offsets = sample_offsets(device_size, config.bins);
     let mut samples = Vec::with_capacity(offsets.len());
 
     eprintln!(
-        "benchmarking {}: size {}, {} samples, {} per sample",
+        "benchmarking {}: size {}, {} samples, up to {} per sample",
         config.device.display(),
         human_bytes(device_size),
         offsets.len(),
-        human_bytes(sample_bytes)
+        human_duration(config.sample_duration)
     );
     eprintln!(
         "read-only direct I/O benchmark; no writes will be issued and the Linux page cache is bypassed"
     );
 
     for (index, offset) in offsets.into_iter().enumerate() {
-        let sample = read_sample(&file, index, offset, sample_bytes)?;
+        let sample = read_sample(&file, index, offset, device_size, config.sample_duration)?;
         println!(
             "{:>5} {:>7.2}% offset {:>12} read {:>10} in {:>7.3}s {:>9.2} MiB/s",
             sample.index + 1,
@@ -124,7 +126,7 @@ fn run() -> Result<(), String> {
         &run_metadata,
         &output,
         device_size,
-        sample_bytes,
+        config.sample_duration,
         &samples,
     )?;
     write_markdown_report(
@@ -133,7 +135,7 @@ fn run() -> Result<(), String> {
         &output,
         &markdown_output,
         device_size,
-        sample_bytes,
+        config.sample_duration,
         &samples,
     )?;
     print_summary(&samples, &output, &markdown_output);
@@ -148,7 +150,7 @@ impl Config {
     {
         let mut device = None;
         let mut bins = DEFAULT_BINS;
-        let mut sample_mib = DEFAULT_SAMPLE_MIB;
+        let mut sample_ms = DEFAULT_SAMPLE_MS;
         let mut output = None;
 
         let mut args = args.into_iter();
@@ -164,10 +166,10 @@ impl Config {
                         return Err("--bins must be greater than zero".to_string());
                     }
                 }
-                "--sample-mib" => {
-                    sample_mib = parse_next_u64(&mut args, "--sample-mib")?;
-                    if sample_mib == 0 {
-                        return Err("--sample-mib must be greater than zero".to_string());
+                "--sample-ms" => {
+                    sample_ms = parse_next_u64(&mut args, "--sample-ms")?;
+                    if sample_ms == 0 {
+                        return Err("--sample-ms must be greater than zero".to_string());
                     }
                 }
                 "-o" | "--output" => {
@@ -189,9 +191,7 @@ impl Config {
         Ok(Self {
             device,
             bins,
-            sample_bytes: sample_mib
-                .checked_mul(MIB)
-                .ok_or_else(|| "--sample-mib is too large".to_string())?,
+            sample_duration: Duration::from_millis(sample_ms),
             output,
         })
     }
@@ -216,13 +216,13 @@ fn parse_next_u64(args: &mut impl Iterator<Item = String>, name: &str) -> Result
 
 fn print_usage() {
     println!(
-        "Usage: block-benchie <block-device> [--bins N] [--sample-mib MIB] [--output FILE]\n\
+        "Usage: block-benchie <block-device> [--bins N] [--sample-ms MS] [--output FILE]\n\
 \n\
 Read-only benchmark that samples transfer rate across a block device and writes an SVG graph.\n\
 \n\
 Options:\n\
   --bins N          Number of evenly spaced samples (default: {DEFAULT_BINS})\n\
-  --sample-mib MIB  Bytes to read at each sample point, in MiB (default: {DEFAULT_SAMPLE_MIB})\n\
+  --sample-ms MS    Time budget for each sample in milliseconds (default: {DEFAULT_SAMPLE_MS})\n\
   -o, --output FILE SVG output path (default: block-benchie-DEVICE.svg)\n\
   -h, --help        Show this help"
     );
@@ -358,8 +358,13 @@ fn block_device_size(file: &File) -> io::Result<u64> {
     }
 }
 
-fn sample_offsets(device_size: u64, sample_bytes: u64, bins: usize) -> Vec<u64> {
-    let max_offset = device_size.saturating_sub(sample_bytes);
+fn sample_offsets(device_size: u64, bins: usize) -> Vec<u64> {
+    let end_runway = if device_size > END_RUNWAY_BYTES + ALIGNMENT {
+        END_RUNWAY_BYTES
+    } else {
+        ALIGNMENT
+    };
+    let max_offset = align_down(device_size.saturating_sub(end_runway), ALIGNMENT);
     if bins == 1 || max_offset == 0 {
         return vec![0];
     }
@@ -380,15 +385,17 @@ fn read_sample(
     file: &File,
     index: usize,
     offset: u64,
-    target_bytes: u64,
+    device_size: u64,
+    sample_duration: Duration,
 ) -> Result<Sample, String> {
-    let buffer_len = target_bytes.min(READ_CHUNK_BYTES as u64) as usize;
+    let readable_bytes = align_down(device_size.saturating_sub(offset), ALIGNMENT);
+    let buffer_len = readable_bytes.min(READ_CHUNK_BYTES as u64) as usize;
     let mut buffer = AlignedBuffer::new(buffer_len, ALIGNMENT as usize)?;
     let start = Instant::now();
     let mut bytes_read = 0_u64;
 
-    while bytes_read < target_bytes {
-        let remaining = (target_bytes - bytes_read) as usize;
+    while start.elapsed() < sample_duration && bytes_read < readable_bytes {
+        let remaining = (readable_bytes - bytes_read) as usize;
         let len = remaining.min(buffer.len());
         debug_assert_eq!(len % ALIGNMENT as usize, 0);
         let read = file
@@ -398,7 +405,7 @@ fn read_sample(
         if read == 0 {
             break;
         }
-        if read % ALIGNMENT as usize != 0 && bytes_read + read as u64 != target_bytes {
+        if read % ALIGNMENT as usize != 0 && bytes_read + read as u64 != readable_bytes {
             return Err(format!(
                 "unaligned short read at offset {}: read {read} bytes",
                 offset + bytes_read
@@ -468,7 +475,7 @@ fn write_svg(
     run_metadata: &RunMetadata,
     output: &Path,
     device_size: u64,
-    sample_bytes: u64,
+    sample_duration: Duration,
     samples: &[Sample],
 ) -> Result<(), String> {
     let width = 1200.0;
@@ -496,7 +503,7 @@ fn write_svg(
         run_metadata,
         output,
         device_size,
-        sample_bytes,
+        sample_duration,
         samples,
     );
     svg.push_str(&format!(
@@ -516,9 +523,9 @@ fn write_svg(
         escape_xml(&metadata.label)
     ));
     svg.push_str(&format!(
-        "<text x=\"{margin_left}\" y=\"50\" font-family=\"sans-serif\" font-size=\"12\" fill=\"#475569\">{} samples, {} per sample, device size {}</text>\n",
+        "<text x=\"{margin_left}\" y=\"50\" font-family=\"sans-serif\" font-size=\"12\" fill=\"#475569\">{} samples, up to {} per sample, device size {}</text>\n",
         samples.len(),
-        escape_xml(&human_bytes(sample_bytes)),
+        escape_xml(&human_duration(sample_duration)),
         escape_xml(&human_bytes(device_size))
     ));
     svg.push_str(&format!(
@@ -610,7 +617,7 @@ fn write_svg_metadata(
     run_metadata: &RunMetadata,
     output: &Path,
     device_size: u64,
-    sample_bytes: u64,
+    sample_duration: Duration,
     samples: &[Sample],
 ) {
     svg.push_str("<metadata>\n");
@@ -627,11 +634,12 @@ fn write_svg_metadata(
         ));
     }
     svg.push_str(&format!(
-        " output-path=\"{}\" io=\"direct\" open-flag=\"O_DIRECT\" device-size-bytes=\"{}\" sample-bytes=\"{}\" samples=\"{}\" read-chunk-bytes=\"{}\" alignment-bytes=\"{}\" generated-unix-seconds=\"{}\" generated-utc=\"{}\" />\n",
+        " output-path=\"{}\" io=\"direct\" open-flag=\"O_DIRECT\" device-size-bytes=\"{}\" sample-duration-ms=\"{}\" samples=\"{}\" end-runway-bytes=\"{}\" read-chunk-bytes=\"{}\" alignment-bytes=\"{}\" generated-unix-seconds=\"{}\" generated-utc=\"{}\" />\n",
         escape_xml_attr(&output.display().to_string()),
         device_size,
-        sample_bytes,
+        sample_duration.as_millis(),
         samples.len(),
+        END_RUNWAY_BYTES,
         READ_CHUNK_BYTES,
         ALIGNMENT,
         run_metadata.generated_unix_seconds,
@@ -646,7 +654,7 @@ fn write_markdown_report(
     svg_output: &Path,
     markdown_output: &Path,
     device_size: u64,
-    sample_bytes: u64,
+    sample_duration: Duration,
     samples: &[Sample],
 ) -> Result<(), String> {
     let mut markdown = String::new();
@@ -695,10 +703,19 @@ fn write_markdown_report(
     );
     push_markdown_row(
         &mut markdown,
-        "Sample size",
-        &format!("{} ({sample_bytes} bytes)", human_bytes(sample_bytes)),
+        "Sample duration",
+        &human_duration(sample_duration),
     );
     push_markdown_row(&mut markdown, "Samples", &samples.len().to_string());
+    push_markdown_row(
+        &mut markdown,
+        "End runway",
+        &format!(
+            "{} ({} bytes)",
+            human_bytes(END_RUNWAY_BYTES),
+            END_RUNWAY_BYTES
+        ),
+    );
     push_markdown_row(
         &mut markdown,
         "Read chunk size",
@@ -826,6 +843,15 @@ fn human_bytes(bytes: u64) -> String {
         format!("{bytes} {unit}")
     } else {
         format!("{value:.2} {unit}")
+    }
+}
+
+fn human_duration(duration: Duration) -> String {
+    let millis = duration.as_millis();
+    if millis < 1000 {
+        format!("{millis} ms")
+    } else {
+        format!("{:.3} s", duration.as_secs_f64())
     }
 }
 
