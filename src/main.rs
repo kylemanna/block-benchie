@@ -1,20 +1,18 @@
-use std::alloc::{alloc_zeroed, dealloc, Layout};
-use std::env;
+use aligned_vec::avec_rt;
+use clap::Parser;
 use std::ffi::{c_int, c_ulong, c_void};
 use std::fs::{self, File, OpenOptions};
 use std::io;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::FileExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::ptr::NonNull;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-const DEFAULT_BINS: usize = 200;
-const DEFAULT_SAMPLE_MS: u64 = 100;
 const READ_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
@@ -27,11 +25,22 @@ unsafe extern "C" {
     fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
 }
 
-#[derive(Debug)]
+#[derive(Debug, Parser)]
+#[command(about = "Read-only direct-I/O block device transfer-rate sampler")]
 struct Config {
+    /// Block device path to benchmark.
     device: PathBuf,
-    bins: usize,
-    sample_duration: Duration,
+
+    /// Number of evenly spaced samples.
+    #[arg(long, default_value = "200")]
+    bins: NonZeroUsize,
+
+    /// Time budget for each sample in milliseconds.
+    #[arg(long = "sample-ms", default_value = "100")]
+    sample_ms: NonZeroU64,
+
+    /// SVG output path.
+    #[arg(short, long)]
     output: Option<PathBuf>,
 }
 
@@ -58,6 +67,13 @@ struct Sample {
     mib_per_sec: f64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SummaryStats {
+    min_rate: f64,
+    average_rate: f64,
+    max_rate: f64,
+}
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("error: {err}");
@@ -66,7 +82,8 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let config = Config::parse(env::args().skip(1))?;
+    let config = Config::parse();
+    let sample_duration = config.sample_duration();
     let device_metadata = DeviceMetadata::for_path(&config.device);
     let output = config
         .output
@@ -83,7 +100,10 @@ fn run() -> Result<(), String> {
     })?;
 
     if device_size == 0 {
-        return Err(format!("{} has zero readable bytes", config.device.display()));
+        return Err(format!(
+            "{} has zero readable bytes",
+            config.device.display()
+        ));
     }
 
     if device_size < ALIGNMENT {
@@ -93,7 +113,7 @@ fn run() -> Result<(), String> {
         ));
     }
 
-    let offsets = sample_offsets(device_size, config.bins);
+    let offsets = sample_offsets(device_size, config.bins.get());
     let mut samples = Vec::with_capacity(offsets.len());
 
     eprintln!(
@@ -101,14 +121,14 @@ fn run() -> Result<(), String> {
         config.device.display(),
         human_bytes(device_size),
         offsets.len(),
-        human_duration(config.sample_duration)
+        humantime::format_duration(sample_duration)
     );
     eprintln!(
         "read-only direct I/O benchmark; no writes will be issued and the Linux page cache is bypassed"
     );
 
     for (index, offset) in offsets.into_iter().enumerate() {
-        let sample = read_sample(&file, index, offset, device_size, config.sample_duration)?;
+        let sample = read_sample(&file, index, offset, device_size, sample_duration)?;
         println!(
             "{:>5} {:>7.2}% offset {:>12} read {:>10} in {:>7.3}s {:>9.2} MiB/s",
             sample.index + 1,
@@ -121,13 +141,16 @@ fn run() -> Result<(), String> {
         samples.push(sample);
     }
 
+    let summary = SummaryStats::from_samples(&samples);
+
     write_svg(
         &device_metadata,
         &run_metadata,
         &output,
         device_size,
-        config.sample_duration,
+        sample_duration,
         &samples,
+        summary,
     )?;
     write_markdown_report(
         &device_metadata,
@@ -135,97 +158,19 @@ fn run() -> Result<(), String> {
         &output,
         &markdown_output,
         device_size,
-        config.sample_duration,
+        sample_duration,
         &samples,
+        summary,
     )?;
-    print_summary(&samples, &output, &markdown_output);
+    print_summary(summary, &output, &markdown_output);
 
     Ok(())
 }
 
 impl Config {
-    fn parse<I>(args: I) -> Result<Self, String>
-    where
-        I: IntoIterator<Item = String>,
-    {
-        let mut device = None;
-        let mut bins = DEFAULT_BINS;
-        let mut sample_ms = DEFAULT_SAMPLE_MS;
-        let mut output = None;
-
-        let mut args = args.into_iter();
-        while let Some(arg) = args.next() {
-            match arg.as_str() {
-                "-h" | "--help" => {
-                    print_usage();
-                    std::process::exit(0);
-                }
-                "--bins" => {
-                    bins = parse_next_usize(&mut args, "--bins")?;
-                    if bins == 0 {
-                        return Err("--bins must be greater than zero".to_string());
-                    }
-                }
-                "--sample-ms" => {
-                    sample_ms = parse_next_u64(&mut args, "--sample-ms")?;
-                    if sample_ms == 0 {
-                        return Err("--sample-ms must be greater than zero".to_string());
-                    }
-                }
-                "-o" | "--output" => {
-                    output = Some(PathBuf::from(next_arg(&mut args, arg.as_str())?));
-                }
-                _ if arg.starts_with('-') => {
-                    return Err(format!("unknown option: {arg}"));
-                }
-                _ => {
-                    if device.replace(PathBuf::from(&arg)).is_some() {
-                        return Err(format!("unexpected extra positional argument: {arg}"));
-                    }
-                }
-            }
-        }
-
-        let device = device.ok_or_else(|| "missing block device path".to_string())?;
-
-        Ok(Self {
-            device,
-            bins,
-            sample_duration: Duration::from_millis(sample_ms),
-            output,
-        })
+    fn sample_duration(&self) -> Duration {
+        Duration::from_millis(self.sample_ms.get())
     }
-}
-
-fn next_arg(args: &mut impl Iterator<Item = String>, name: &str) -> Result<String, String> {
-    args.next()
-        .ok_or_else(|| format!("{name} requires a value"))
-}
-
-fn parse_next_usize(args: &mut impl Iterator<Item = String>, name: &str) -> Result<usize, String> {
-    next_arg(args, name)?
-        .parse()
-        .map_err(|err| format!("invalid value for {name}: {err}"))
-}
-
-fn parse_next_u64(args: &mut impl Iterator<Item = String>, name: &str) -> Result<u64, String> {
-    next_arg(args, name)?
-        .parse()
-        .map_err(|err| format!("invalid value for {name}: {err}"))
-}
-
-fn print_usage() {
-    println!(
-        "Usage: block-benchie <block-device> [--bins N] [--sample-ms MS] [--output FILE]\n\
-\n\
-Read-only benchmark that samples transfer rate across a block device and writes an SVG graph.\n\
-\n\
-Options:\n\
-  --bins N          Number of evenly spaced samples (default: {DEFAULT_BINS})\n\
-  --sample-ms MS    Time budget for each sample in milliseconds (default: {DEFAULT_SAMPLE_MS})\n\
-  -o, --output FILE SVG output path (default: block-benchie-DEVICE.svg)\n\
-  -h, --help        Show this help"
-    );
 }
 
 impl DeviceMetadata {
@@ -255,10 +200,43 @@ impl DeviceMetadata {
 
 impl RunMetadata {
     fn new() -> Self {
-        let generated_unix_seconds = generated_unix_seconds();
+        let generated_time = SystemTime::now();
+        let generated_unix_seconds = generated_time
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+
         Self {
             generated_unix_seconds,
-            generated_utc: format_utc_unix_seconds(generated_unix_seconds),
+            generated_utc: humantime::format_rfc3339_seconds(generated_time).to_string(),
+        }
+    }
+}
+
+impl SummaryStats {
+    fn from_samples(samples: &[Sample]) -> Self {
+        if samples.is_empty() {
+            return Self {
+                min_rate: 0.0,
+                average_rate: 0.0,
+                max_rate: 0.0,
+            };
+        }
+
+        let mut min_rate = f64::INFINITY;
+        let mut max_rate = 0.0_f64;
+        let mut total_rate = 0.0;
+
+        for sample in samples {
+            min_rate = min_rate.min(sample.mib_per_sec);
+            max_rate = max_rate.max(sample.mib_per_sec);
+            total_rate += sample.mib_per_sec;
+        }
+
+        Self {
+            min_rate,
+            average_rate: total_rate / samples.len() as f64,
+            max_rate,
         }
     }
 }
@@ -301,7 +279,10 @@ fn device_label_from_by_id(name: &str) -> String {
 }
 
 fn default_output_path(metadata: &DeviceMetadata) -> PathBuf {
-    PathBuf::from(format!("block-benchie-{}.svg", filename_safe(&metadata.label)))
+    PathBuf::from(format!(
+        "block-benchie-{}.svg",
+        filename_safe(&metadata.label)
+    ))
 }
 
 fn markdown_output_path(svg_output: &Path) -> PathBuf {
@@ -332,7 +313,12 @@ fn open_direct(path: &Path) -> Result<File, String> {
         .read(true)
         .custom_flags(O_DIRECT)
         .open(path)
-        .map_err(|err| format!("failed to open {} read-only with O_DIRECT: {err}", path.display()))
+        .map_err(|err| {
+            format!(
+                "failed to open {} read-only with O_DIRECT: {err}",
+                path.display()
+            )
+        })
 }
 
 fn block_device_size(file: &File) -> io::Result<u64> {
@@ -390,7 +376,7 @@ fn read_sample(
 ) -> Result<Sample, String> {
     let readable_bytes = align_down(device_size.saturating_sub(offset), ALIGNMENT);
     let buffer_len = readable_bytes.min(READ_CHUNK_BYTES as u64) as usize;
-    let mut buffer = AlignedBuffer::new(buffer_len, ALIGNMENT as usize)?;
+    let mut buffer = avec_rt![[ALIGNMENT as usize]| 0_u8; buffer_len];
     let start = Instant::now();
     let mut bytes_read = 0_u64;
 
@@ -399,7 +385,7 @@ fn read_sample(
         let len = remaining.min(buffer.len());
         debug_assert_eq!(len % ALIGNMENT as usize, 0);
         let read = file
-            .read_at(buffer.as_mut_slice(len), offset + bytes_read)
+            .read_at(&mut buffer[..len], offset + bytes_read)
             .map_err(|err| format!("read failed at offset {}: {err}", offset + bytes_read))?;
 
         if read == 0 {
@@ -431,45 +417,6 @@ fn read_sample(
     })
 }
 
-struct AlignedBuffer {
-    ptr: NonNull<u8>,
-    len: usize,
-    layout: Layout,
-}
-
-impl AlignedBuffer {
-    fn new(len: usize, alignment: usize) -> Result<Self, String> {
-        let layout = Layout::from_size_align(len, alignment)
-            .map_err(|err| format!("invalid direct I/O buffer layout: {err}"))?;
-        let ptr = unsafe { alloc_zeroed(layout) };
-        let ptr = NonNull::new(ptr).ok_or_else(|| {
-            format!(
-                "failed to allocate {} direct I/O buffer aligned to {alignment} bytes",
-                human_bytes(len as u64)
-            )
-        })?;
-
-        Ok(Self { ptr, len, layout })
-    }
-
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    fn as_mut_slice(&mut self, len: usize) -> &mut [u8] {
-        assert!(len <= self.len);
-        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), len) }
-    }
-}
-
-impl Drop for AlignedBuffer {
-    fn drop(&mut self) {
-        unsafe {
-            dealloc(self.ptr.as_ptr(), self.layout);
-        }
-    }
-}
-
 fn write_svg(
     metadata: &DeviceMetadata,
     run_metadata: &RunMetadata,
@@ -477,6 +424,7 @@ fn write_svg(
     device_size: u64,
     sample_duration: Duration,
     samples: &[Sample],
+    summary: SummaryStats,
 ) -> Result<(), String> {
     let width = 1200.0;
     let height = 520.0;
@@ -486,8 +434,7 @@ fn write_svg(
     let margin_bottom = 72.0;
     let plot_width = width - margin_left - margin_right;
     let plot_height = height - margin_top - margin_bottom;
-    let max_rate = max_rate(samples).max(1.0);
-    let avg_rate = average_rate(samples);
+    let graph_max_rate = summary.max_rate.max(1.0);
     let bar_width = (plot_width / samples.len().max(1) as f64).max(1.0);
 
     let mut svg = String::new();
@@ -514,8 +461,8 @@ fn write_svg(
         "<desc id=\"desc\">Read-only transfer-rate samples across {}, generated at {}, maximum {:.2} MiB/s, average {:.2} MiB/s.</desc>\n",
         escape_xml(&human_bytes(device_size)),
         escape_xml(&run_metadata.generated_utc),
-        max_rate,
-        avg_rate
+        summary.max_rate,
+        summary.average_rate
     ));
     svg.push_str("<rect width=\"1200\" height=\"520\" fill=\"#f8fafc\"/>\n");
     svg.push_str(&format!(
@@ -525,7 +472,7 @@ fn write_svg(
     svg.push_str(&format!(
         "<text x=\"{margin_left}\" y=\"50\" font-family=\"sans-serif\" font-size=\"12\" fill=\"#475569\">{} samples, up to {} per sample, device size {}</text>\n",
         samples.len(),
-        escape_xml(&human_duration(sample_duration)),
+        escape_xml(&humantime::format_duration(sample_duration).to_string()),
         escape_xml(&human_bytes(device_size))
     ));
     svg.push_str(&format!(
@@ -536,7 +483,7 @@ fn write_svg(
     for tick in 0..=5 {
         let ratio = tick as f64 / 5.0;
         let y = margin_top + plot_height - ratio * plot_height;
-        let rate = ratio * max_rate;
+        let rate = ratio * graph_max_rate;
         svg.push_str(&format!(
             "<line x1=\"{margin_left:.1}\" y1=\"{y:.1}\" x2=\"{:.1}\" y2=\"{y:.1}\" stroke=\"#e2e8f0\"/>\n",
             width - margin_right
@@ -574,7 +521,7 @@ fn write_svg(
     ));
 
     for (i, sample) in samples.iter().enumerate() {
-        let rate_ratio = (sample.mib_per_sec / max_rate).clamp(0.0, 1.0);
+        let rate_ratio = (sample.mib_per_sec / graph_max_rate).clamp(0.0, 1.0);
         let bar_height = rate_ratio * plot_height;
         let x = margin_left + i as f64 * bar_width;
         let y = margin_top + plot_height - bar_height;
@@ -584,7 +531,8 @@ fn write_svg(
         ));
     }
 
-    let avg_y = margin_top + plot_height - (avg_rate / max_rate).clamp(0.0, 1.0) * plot_height;
+    let avg_ratio = (summary.average_rate / graph_max_rate).clamp(0.0, 1.0);
+    let avg_y = margin_top + plot_height - avg_ratio * plot_height;
     svg.push_str(&format!(
         "<line x1=\"{margin_left:.1}\" y1=\"{avg_y:.1}\" x2=\"{:.1}\" y2=\"{avg_y:.1}\" stroke=\"#dc2626\" stroke-width=\"2\" stroke-dasharray=\"6 5\"/>\n",
         width - margin_right
@@ -593,7 +541,7 @@ fn write_svg(
         "<text x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"end\" font-family=\"sans-serif\" font-size=\"12\" fill=\"#dc2626\">avg {:.2} MiB/s</text>\n",
         width - margin_right,
         avg_y - 7.0,
-        avg_rate
+        summary.average_rate
     ));
 
     svg.push_str(&format!(
@@ -656,6 +604,7 @@ fn write_markdown_report(
     device_size: u64,
     sample_duration: Duration,
     samples: &[Sample],
+    summary: SummaryStats,
 ) -> Result<(), String> {
     let mut markdown = String::new();
     markdown.push_str(&format!(
@@ -671,7 +620,11 @@ fn write_markdown_report(
         &run_metadata.generated_unix_seconds.to_string(),
     );
     push_markdown_row(&mut markdown, "Generated UTC", &run_metadata.generated_utc);
-    push_markdown_row(&mut markdown, "Input path", &metadata.input_path.display().to_string());
+    push_markdown_row(
+        &mut markdown,
+        "Input path",
+        &metadata.input_path.display().to_string(),
+    );
     push_markdown_row(
         &mut markdown,
         "Canonical path",
@@ -688,7 +641,11 @@ fn write_markdown_report(
             .as_deref()
             .unwrap_or(""),
     );
-    push_markdown_row(&mut markdown, "SVG output", &svg_output.display().to_string());
+    push_markdown_row(
+        &mut markdown,
+        "SVG output",
+        &svg_output.display().to_string(),
+    );
     push_markdown_row(
         &mut markdown,
         "Markdown output",
@@ -704,7 +661,7 @@ fn write_markdown_report(
     push_markdown_row(
         &mut markdown,
         "Sample duration",
-        &human_duration(sample_duration),
+        &humantime::format_duration(sample_duration).to_string(),
     );
     push_markdown_row(&mut markdown, "Samples", &samples.len().to_string());
     push_markdown_row(
@@ -725,27 +682,29 @@ fn write_markdown_report(
             READ_CHUNK_BYTES
         ),
     );
-    push_markdown_row(
-        &mut markdown,
-        "Alignment",
-        &format!("{} bytes", ALIGNMENT),
-    );
+    push_markdown_row(&mut markdown, "Alignment", &format!("{} bytes", ALIGNMENT));
 
     markdown.push_str("\n## Summary\n\n");
     markdown.push_str("| Metric | Value |\n");
     markdown.push_str("| --- | --- |\n");
-    push_markdown_row(&mut markdown, "Minimum", &format!("{:.2} MiB/s", min_rate(samples)));
+    push_markdown_row(
+        &mut markdown,
+        "Minimum",
+        &format!("{:.2} MiB/s", summary.min_rate),
+    );
     push_markdown_row(
         &mut markdown,
         "Average",
-        &format!("{:.2} MiB/s", average_rate(samples)),
+        &format!("{:.2} MiB/s", summary.average_rate),
     );
-    push_markdown_row(&mut markdown, "Maximum", &format!("{:.2} MiB/s", max_rate(samples)));
+    push_markdown_row(
+        &mut markdown,
+        "Maximum",
+        &format!("{:.2} MiB/s", summary.max_rate),
+    );
 
     markdown.push_str("\n## Samples\n\n");
-    markdown.push_str(
-        "| Sample | Position | Offset | Bytes read | Elapsed seconds | MiB/s |\n",
-    );
+    markdown.push_str("| Sample | Position | Offset | Bytes read | Elapsed seconds | MiB/s |\n");
     markdown.push_str("| ---: | ---: | ---: | ---: | ---: | ---: |\n");
     for sample in samples {
         markdown.push_str(&format!(
@@ -779,43 +738,13 @@ fn markdown_cell(value: &str) -> String {
         .replace('\r', " ")
 }
 
-fn print_summary(samples: &[Sample], svg_output: &Path, markdown_output: &Path) {
-    let min = min_rate(samples);
-    let max = max_rate(samples);
-    let avg = average_rate(samples);
-
+fn print_summary(summary: SummaryStats, svg_output: &Path, markdown_output: &Path) {
     eprintln!(
         "summary: min {:.2} MiB/s, avg {:.2} MiB/s, max {:.2} MiB/s",
-        min, avg, max
+        summary.min_rate, summary.average_rate, summary.max_rate
     );
     eprintln!("wrote {}", svg_output.display());
     eprintln!("wrote {}", markdown_output.display());
-}
-
-fn average_rate(samples: &[Sample]) -> f64 {
-    if samples.is_empty() {
-        return 0.0;
-    }
-
-    samples
-        .iter()
-        .map(|sample| sample.mib_per_sec)
-        .sum::<f64>()
-        / samples.len() as f64
-}
-
-fn min_rate(samples: &[Sample]) -> f64 {
-    samples
-        .iter()
-        .map(|sample| sample.mib_per_sec)
-        .fold(f64::INFINITY, f64::min)
-}
-
-fn max_rate(samples: &[Sample]) -> f64 {
-    samples
-        .iter()
-        .map(|sample| sample.mib_per_sec)
-        .fold(0.0_f64, f64::max)
 }
 
 fn position_percent(offset: u64, device_size: u64) -> f64 {
@@ -846,15 +775,6 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
-fn human_duration(duration: Duration) -> String {
-    let millis = duration.as_millis();
-    if millis < 1000 {
-        format!("{millis} ms")
-    } else {
-        format!("{:.3} s", duration.as_secs_f64())
-    }
-}
-
 fn escape_xml(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -866,41 +786,4 @@ fn escape_xml(value: &str) -> String {
 
 fn escape_xml_attr(value: &str) -> String {
     escape_xml(value)
-}
-
-fn generated_unix_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
-}
-
-fn format_utc_unix_seconds(seconds: u64) -> String {
-    let days = seconds / 86_400;
-    let seconds_of_day = seconds % 86_400;
-    let (year, month, day) = civil_from_days(days as i64);
-    let hour = seconds_of_day / 3_600;
-    let minute = seconds_of_day % 3_600 / 60;
-    let second = seconds_of_day % 60;
-
-    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} UTC")
-}
-
-fn civil_from_days(days_since_unix_epoch: i64) -> (i64, u32, u32) {
-    let days = days_since_unix_epoch + 719_468;
-    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
-    let day_of_era = days - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let mut year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_prime = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
-    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
-
-    if month <= 2 {
-        year += 1;
-    }
-
-    (year, month as u32, day as u32)
 }

@@ -8,3 +8,6 @@ name = "block-benchie"
 path = "src/main.rs"
 
 [dependencies]
+aligned-vec = "0.6"
+clap = { version = "4", features = ["derive"] }
+humantime = "2"
